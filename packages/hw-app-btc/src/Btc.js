@@ -47,7 +47,8 @@ export default class Btc {
         "getWalletPublicKey",
         "signP2SHTransaction",
         "signMessageNew",
-        "createPaymentTransactionNew"
+        "createPaymentTransactionNew",
+        "signUtxo"
       ],
       scrambleKey
     );
@@ -107,7 +108,7 @@ export default class Btc {
     });
   }
 
-  /**
+    /**
    * @param path a BIP 32 path
    * @param options an object with optional these fields:
    *
@@ -596,6 +597,110 @@ export default class Btc {
     });
   }
 
+  /**
+   * You can sign a message according to the Bitcoin Signature format and retrieve v, r, s given the message and the BIP 32 path of the account to sign.
+   * @example
+   btc.signMessageNew_async("44'/60'/0'/0'/0", Buffer.from("test").toString("hex")).then(function(result) {
+     var v = result['v'] + 27 + 4;
+     var signature = Buffer.from(v.toString(16) + result['r'] + result['s'], 'hex').toString('base64');
+     console.log("Signature : " + signature);
+   }).catch(function(ex) {console.log(ex);});
+   */
+  signUtxo(
+    path: string,
+    utxoHex: string
+  ): Promise<{ v: number, r: string, s: string }> {
+    console.log('on signUtxo library start');
+    console.log('utxoHex:');
+    console.log(utxoHex);
+    const paths = splitPath(path);
+
+    const utxoSerialized = this.serializeUtxo(utxoHex);
+    console.log('utxoSerialized:');
+    console.log(utxoSerialized);
+
+    console.log('hash:');
+    let sha = createHash("sha256");
+    sha.update(new Buffer(utxoSerialized));
+    let hash = sha.digest();
+    sha = createHash("sha256");
+    sha.update(hash);
+    hash = sha.digest();
+    hash = hash.reverse();
+    console.log(hash);
+
+    // const utxo = new Buffer(utxoHex, "hex");
+    const message = hash;
+    
+    let offset = 0;
+    const toSend = [];
+    while (offset !== message.length) {
+      let maxChunkSize =
+        offset === 0
+          ? MAX_SCRIPT_BLOCK - 1 - paths.length * 4 - 4
+          : MAX_SCRIPT_BLOCK;
+      let chunkSize =
+        offset + maxChunkSize > message.length
+          ? message.length - offset
+          : maxChunkSize;
+      const buffer = new Buffer(
+        offset === 0 ? 1 + paths.length * 4 + 2 + chunkSize : chunkSize
+      );
+      if (offset === 0) {
+        buffer[0] = paths.length;
+        paths.forEach((element, index) => {
+          buffer.writeUInt32BE(element, 1 + 4 * index);
+        });
+        buffer.writeUInt16BE(message.length, 1 + 4 * paths.length);
+        message.copy(
+          buffer,
+          1 + 4 * paths.length + 2,
+          offset,
+          offset + chunkSize
+        );
+      } else {
+        message.copy(buffer, 0, offset, offset + chunkSize);
+      }
+      toSend.push(buffer);
+      offset += chunkSize;
+    }
+    return foreach(toSend, (data, i) =>
+      this.transport.send(0xe0, 0x4e, 0x00, i === 0 ? 0x01 : 0x80, data)
+    ).then(() => {
+      return this.transport
+        .send(0xe0, 0x4e, 0x80, 0x00, Buffer.from([0x00]))
+        .then(response => {
+          const v = response[0] - 0x30;
+          let r = response.slice(4, 4 + response[3]);
+          if (r[0] === 0) {
+            r = r.slice(1);
+          }
+          r = r.toString("hex");
+          let offset = 4 + response[3] + 2;
+          let s = response.slice(offset, offset + response[offset - 1]);
+          if (s[0] === 0) {
+            s = s.slice(1);
+          }
+          s = s.toString("hex");
+          return { v, r, s };
+        });
+    });
+  }
+
+  serializeUtxo(msg: string): Array<number> {
+    let serialized: Array<number> = [];
+    const [txid, vout] = msg.split(':');
+    for (let i = txid.length - 2; i >= 0; i -= 2) {
+      serialized.push(parseInt(txid.substr(i, 2), 16));
+    }
+    const n_vout = parseInt(vout, 10);
+    for (let i = 0; i < 4; i++) {
+      serialized.push(n_vout & (255 << (8 * i)))
+    }
+
+    return serialized;
+  }
+  
   /**
    * To sign a transaction involving standard (P2PKH) inputs, call createPaymentTransactionNew with the following parameters
    * @param inputs is an array of [ transaction, output_index, optional redeem script, optional sequence ] where
